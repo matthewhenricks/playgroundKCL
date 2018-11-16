@@ -16,6 +16,10 @@
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.charset.Charset;
+import java.nio.charset.CharsetDecoder;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -25,20 +29,25 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.model.PutObjectResult;
 import org.apache.commons.lang3.ObjectUtils;
 import org.apache.commons.lang3.RandomStringUtils;
-import org.apache.commons.lang3.RandomUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudwatch.CloudWatchAsyncClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.kinesis.KinesisAsyncClient;
 import software.amazon.awssdk.services.kinesis.model.PutRecordRequest;
 import software.amazon.kinesis.common.ConfigsBuilder;
+import software.amazon.kinesis.common.InitialPositionInStream;
+import software.amazon.kinesis.common.InitialPositionInStreamExtended;
 import software.amazon.kinesis.coordinator.Scheduler;
 import software.amazon.kinesis.exceptions.InvalidStateException;
 import software.amazon.kinesis.exceptions.ShutdownException;
@@ -47,12 +56,16 @@ import software.amazon.kinesis.lifecycle.events.LeaseLostInput;
 import software.amazon.kinesis.lifecycle.events.ProcessRecordsInput;
 import software.amazon.kinesis.lifecycle.events.ShardEndedInput;
 import software.amazon.kinesis.lifecycle.events.ShutdownRequestedInput;
+import software.amazon.kinesis.processor.RecordProcessorCheckpointer;
 import software.amazon.kinesis.processor.ShardRecordProcessor;
 import software.amazon.kinesis.processor.ShardRecordProcessorFactory;
+import software.amazon.kinesis.retrieval.KinesisClientRecord;
 
 public class SampleSingle {
 
     private static final Logger log = LoggerFactory.getLogger(SampleSingle.class);
+
+    private static final InitialPositionInStreamExtended STREAM_START = InitialPositionInStreamExtended.newInitialPosition(InitialPositionInStream.TRIM_HORIZON);
 
     public static void main(String... args) {
         if (args.length < 1) {
@@ -71,7 +84,7 @@ public class SampleSingle {
     }
 
     private final String streamName;
-    private final String applicationName = "KCL-Attempt";
+    private final String applicationName = "reader-java";
     private final Region region;
     private final KinesisAsyncClient kinesisClient;
 
@@ -87,12 +100,12 @@ public class SampleSingle {
 
         DynamoDbAsyncClient dynamoClient = DynamoDbAsyncClient.builder().region(region).build();
         CloudWatchAsyncClient cloudWatchClient = CloudWatchAsyncClient.builder().region(region).build();
-        ConfigsBuilder configsBuilder = new ConfigsBuilder(streamName, applicationName, kinesisClient, dynamoClient, cloudWatchClient, UUID.randomUUID().toString(), new SampleRecordProcessorFactory());
+        ConfigsBuilder configsBuilder = new ConfigsBuilder(streamName, streamName + "_" + applicationName, kinesisClient, dynamoClient, cloudWatchClient, UUID.randomUUID().toString(), new SampleRecordProcessorFactory());
 
         Scheduler scheduler = new Scheduler(
                 configsBuilder.checkpointConfig(),
                 configsBuilder.coordinatorConfig(),
-                configsBuilder.leaseManagementConfig(),
+                configsBuilder.leaseManagementConfig().initialPositionInStream(STREAM_START),
                 configsBuilder.lifecycleConfig(),
                 configsBuilder.metricsConfig(),
                 configsBuilder.processorConfig(),
@@ -129,11 +142,13 @@ public class SampleSingle {
         log.info("Completed, shutting down now.");
     }
 
+    private Integer putCount = 0;
+
     private void publishRecord() {
         PutRecordRequest request = PutRecordRequest.builder()
                 .partitionKey(RandomStringUtils.randomAlphabetic(5, 20))
                 .streamName(streamName)
-                .data(SdkBytes.fromByteArray(RandomUtils.nextBytes(10)))
+                .data(SdkBytes.fromUtf8String("Number: " + (putCount++).toString()))
                 .build();
         try {
             kinesisClient.putRecord(request).get();
@@ -150,41 +165,71 @@ public class SampleSingle {
         }
     }
 
-
     private static class SampleRecordProcessor implements ShardRecordProcessor {
 
         private static final String SHARD_ID_MDC_KEY = "ShardId";
 
+        private final AmazonS3 s3Client = AmazonS3ClientBuilder.standard()
+                .withRegion("us-west-2")
+                .build();
+
         private static final Logger log = LoggerFactory.getLogger(SampleRecordProcessor.class);
 
         private String shardId;
+
+        private static final long CHECKPOINT_INTERVAL_MILLIS = 5000L;
+        private long nextCheckpointTimeInMillis;
+        private List<String> recordBuffer = new ArrayList<String>();
+        private final CharsetDecoder decoder = Charset.forName("UTF-8").newDecoder();
 
         public void initialize(InitializationInput initializationInput) {
             shardId = initializationInput.shardId();
             MDC.put(SHARD_ID_MDC_KEY, shardId);
             try {
                 log.info("Initializing @ Sequence: {}", initializationInput.extendedSequenceNumber());
+                nextCheckpointTimeInMillis = System.currentTimeMillis() + CHECKPOINT_INTERVAL_MILLIS;
             } finally {
                 MDC.remove(SHARD_ID_MDC_KEY);
             }
         }
 
+        private void sendToS3AndCheckpoint(RecordProcessorCheckpointer checkpointer) throws InvalidStateException, ShutdownException {
+            PutObjectResult res = s3Client.putObject("xealth.dev.analytics", "kcl_example/" + UUID.randomUUID().toString() + ".txt", String.join("\n", recordBuffer));
+            log.info(res.toString());
+            recordBuffer.clear();
+            checkpointer.checkpoint();
+        }
+
         public void processRecords(ProcessRecordsInput processRecordsInput) {
             MDC.put(SHARD_ID_MDC_KEY, shardId);
-            try {
-                log.info("Processing {} record(s)", processRecordsInput.records().size());
-                processRecordsInput.records().forEach(r -> log.info("Processing record pk: {} -- Seq: {}", r.partitionKey(), r.sequenceNumber()));
-            } catch (Throwable t) {
-                log.error("Caught throwable while processing records.  Aborting");
-                Runtime.getRuntime().halt(1);
-            } finally {
-                MDC.remove(SHARD_ID_MDC_KEY);
+
+            List<KinesisClientRecord> records = processRecordsInput.records();
+            if (records != null) {
+                try {
+                    long millUntilDump = nextCheckpointTimeInMillis - System.currentTimeMillis();
+                    log.info("Processing {} record(s). Dump time remaining: {}", processRecordsInput.records().size(), millUntilDump);
+                    for (int i = 0; i < records.size(); i++) {
+                        recordBuffer.add(decoder.decode(records.get(i).data()).toString());
+                    }
+                    if (millUntilDump < 0) {
+                        sendToS3AndCheckpoint(processRecordsInput.checkpointer());
+                        nextCheckpointTimeInMillis = System.currentTimeMillis() + CHECKPOINT_INTERVAL_MILLIS;
+                    }
+                } catch (Throwable t) {
+                    log.error("Caught throwable while processing records. Aborting");
+                    log.info(t.toString());
+                    log.info(t.getStackTrace().toString());
+                    Runtime.getRuntime().halt(1);
+                } finally {
+                    MDC.remove(SHARD_ID_MDC_KEY);
+                }
             }
         }
 
         public void leaseLost(LeaseLostInput leaseLostInput) {
             MDC.put(SHARD_ID_MDC_KEY, shardId);
             try {
+                recordBuffer.clear();
                 log.info("Lost lease, so terminating.");
             } finally {
                 MDC.remove(SHARD_ID_MDC_KEY);
@@ -195,7 +240,7 @@ public class SampleSingle {
             MDC.put(SHARD_ID_MDC_KEY, shardId);
             try {
                 log.info("Reached shard end checkpointing.");
-                shardEndedInput.checkpointer().checkpoint();
+                sendToS3AndCheckpoint(shardEndedInput.checkpointer());
             } catch (ShutdownException | InvalidStateException e) {
                 log.error("Exception while checkpointing at shard end.  Giving up", e);
             } finally {
@@ -206,8 +251,7 @@ public class SampleSingle {
         public void shutdownRequested(ShutdownRequestedInput shutdownRequestedInput) {
             MDC.put(SHARD_ID_MDC_KEY, shardId);
             try {
-                log.info("Scheduler is shutting down, checkpointing.");
-                shutdownRequestedInput.checkpointer().checkpoint();
+                sendToS3AndCheckpoint(shutdownRequestedInput.checkpointer());
             } catch (ShutdownException | InvalidStateException e) {
                 log.error("Exception while checkpointing at requested shutdown.  Giving up", e);
             } finally {
