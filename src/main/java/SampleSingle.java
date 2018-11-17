@@ -30,12 +30,8 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
-import com.amazonaws.ClientConfiguration;
-import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.regions.Regions;
-import com.amazonaws.services.cloudwatch.AmazonCloudWatchAsyncClientBuilder;
-import com.amazonaws.services.dynamodbv2.AmazonDynamoDBAsyncClientBuilder;
 import com.amazonaws.services.kinesis.AmazonKinesisAsync;
 import com.amazonaws.services.kinesis.AmazonKinesisAsyncClientBuilder;
 import com.amazonaws.services.kinesis.clientlibrary.exceptions.InvalidStateException;
@@ -67,7 +63,14 @@ public class SampleSingle {
 
     private static final Logger log = LoggerFactory.getLogger(SampleSingle.class);
 
-    private static final InitialPositionInStream STREAM_START = InitialPositionInStream.TRIM_HORIZON;
+    private final String applicationName = "reader-java-old"; // The name of the metric
+
+    private static final long CHECKPOINT_INTERVAL_MILLIS = 60000L; // Amount of time before S3 PUT actions are taken
+    private static final long Idle_Millis_Between_Calls = 10L; // Time between GetRecords calls
+    private static final int MAX_RECORDS_IN_BUFFER = 10000; // Maximum amount of records that can be buffered
+    private static final int Producer_Period_MS = 1; // Time between Producer PUTS
+
+    private static final int MAX_RECORDS_PER_CALL = 10000; // Amount of max Records that can be retrieved in one GET call
 
     public static void main(String... args) {
         if (args.length < 1) {
@@ -81,22 +84,21 @@ public class SampleSingle {
             region = args[1];
         }
 
-        SampleSingle processor = new SampleSingle(streamName, region);
+        SampleSingle processor = new SampleSingle(streamName);
         processor.run();
     }
 
     private final String streamName;
-    private final String applicationName = "reader-java-old";
     private final AmazonKinesisAsync kinesisClient;
 
-    private SampleSingle(String streamName, String region) {
+    private SampleSingle(String streamName) {
         this.streamName = streamName;
         this.kinesisClient = AmazonKinesisAsyncClientBuilder.standard().withRegion(Regions.US_WEST_2).build();
     }
 
     private void run() {
         ScheduledExecutorService producerExecutor = Executors.newSingleThreadScheduledExecutor();
-        ScheduledFuture<?> producerFuture = producerExecutor.scheduleAtFixedRate(this::publishRecord, 10, 50, TimeUnit.MILLISECONDS);
+        ScheduledFuture<?> producerFuture = producerExecutor.scheduleAtFixedRate(this::publishRecord, 10, Producer_Period_MS, TimeUnit.MILLISECONDS);
 
         String workerId = applicationName + "_" + UUID.randomUUID();
 
@@ -107,8 +109,9 @@ public class SampleSingle {
                 DefaultAWSCredentialsProviderChain.getInstance(),
                 workerId)
                     .withRegionName("us-west-2")
-                    .withIdleMillisBetweenCalls(1000)
-                    .withMaxRecordsCount(10000)
+                    .withIdleMillisBetweenCalls(Idle_Millis_Between_Calls)
+                    .withMaxRecords(MAX_RECORDS_PER_CALL)
+                    .withMaxRecordsCount(MAX_RECORDS_IN_BUFFER)
                     .withInitialPositionInStream(InitialPositionInStream.TRIM_HORIZON);
 
         IRecordProcessorFactory recordProcessorFactory = new SampleRecordProcessorFactory();
@@ -156,23 +159,13 @@ public class SampleSingle {
         putRecordRequest.setStreamName(streamName);
         putRecordRequest.setData(ByteBuffer.wrap(String.format("testData-%d", putCount++).getBytes()));
         putRecordRequest.setPartitionKey(String.format("partitionKey-%d", createTime));
-        PutRecordResult putRecordResult = kinesisClient.putRecord(putRecordRequest);
-        // System.out.printf("Successfully put record, partition key : %s, ShardID : %s, SequenceNumber : %s.\n",
-        //         putRecordRequest.getPartitionKey(),
-        //         putRecordResult.getShardId(),
-        //         putRecordResult.getSequenceNumber());
+        kinesisClient.putRecord(putRecordRequest);
     }
 
     /**
      * Used to create new record processors.
      */
     public class SampleRecordProcessorFactory  implements IRecordProcessorFactory {
-        /**
-         * Constructor.
-         */
-        public SampleRecordProcessorFactory() {
-            super();
-        }
         /**
          * {@inheritDoc}
          */
@@ -190,14 +183,12 @@ public class SampleSingle {
 
         private String shardId;
 
-        private static final long CHECKPOINT_INTERVAL_MILLIS = 5000L;
-
         private final AmazonS3 s3Client = AmazonS3ClientBuilder.standard()
                 .withRegion(Regions.US_WEST_2)
                 .build();
 
         private long nextCheckpointTimeInMillis;
-        private List<String> recordBuffer = new ArrayList<String>();
+        private final List<String> recordBuffer = new ArrayList<String>();
         private final CharsetDecoder decoder = Charset.forName("UTF-8").newDecoder();
 
         /**
