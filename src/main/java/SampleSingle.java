@@ -95,8 +95,8 @@ public class SampleSingle {
     }
 
     private void run() {
-        // ScheduledExecutorService producerExecutor = Executors.newSingleThreadScheduledExecutor();
-        // ScheduledFuture<?> producerFuture = producerExecutor.scheduleAtFixedRate(this::publishRecord, 10, 50, TimeUnit.MILLISECONDS);
+        ScheduledExecutorService producerExecutor = Executors.newSingleThreadScheduledExecutor();
+        ScheduledFuture<?> producerFuture = producerExecutor.scheduleAtFixedRate(this::publishRecord, 10, 50, TimeUnit.MILLISECONDS);
 
         String workerId = applicationName + "_" + UUID.randomUUID();
 
@@ -105,18 +105,17 @@ public class SampleSingle {
                 applicationName,
                 streamName,
                 DefaultAWSCredentialsProviderChain.getInstance(),
-                workerId);
-
-        kinesisClientLibConfiguration.withInitialPositionInStream(InitialPositionInStream.TRIM_HORIZON);
+                workerId)
+                    .withRegionName("us-west-2")
+                    .withIdleMillisBetweenCalls(1000)
+                    .withMaxRecordsCount(10000)
+                    .withInitialPositionInStream(InitialPositionInStream.TRIM_HORIZON);
 
         IRecordProcessorFactory recordProcessorFactory = new SampleRecordProcessorFactory();
 
         final Worker worker = new Worker.Builder()
                 .recordProcessorFactory(recordProcessorFactory)
                 .config(kinesisClientLibConfiguration)
-                .kinesisClient(kinesisClient)
-                .cloudWatchClient(AmazonCloudWatchAsyncClientBuilder.standard().withRegion(Regions.US_WEST_2).build())
-                .dynamoDBClient(AmazonDynamoDBAsyncClientBuilder.standard().withRegion(Regions.US_WEST_2).build())
                 .build();
 
         Thread schedulerThread = new Thread(worker::run);
@@ -132,8 +131,8 @@ public class SampleSingle {
         }
 
         log.info("Cancelling producer, and shutting down excecutor.");
-        // producerFuture.cancel(true);
-        // producerExecutor.shutdownNow();
+        producerFuture.cancel(true);
+        producerExecutor.shutdownNow();
 
         Future<Boolean> gracefulShutdownFuture = worker.startGracefulShutdown();
         log.info("Waiting up to 20 seconds for shutdown to complete.");
@@ -158,10 +157,10 @@ public class SampleSingle {
         putRecordRequest.setData(ByteBuffer.wrap(String.format("testData-%d", putCount++).getBytes()));
         putRecordRequest.setPartitionKey(String.format("partitionKey-%d", createTime));
         PutRecordResult putRecordResult = kinesisClient.putRecord(putRecordRequest);
-        System.out.printf("Successfully put record, partition key : %s, ShardID : %s, SequenceNumber : %s.\n",
-                putRecordRequest.getPartitionKey(),
-                putRecordResult.getShardId(),
-                putRecordResult.getSequenceNumber());
+        // System.out.printf("Successfully put record, partition key : %s, ShardID : %s, SequenceNumber : %s.\n",
+        //         putRecordRequest.getPartitionKey(),
+        //         putRecordResult.getShardId(),
+        //         putRecordResult.getSequenceNumber());
     }
 
     /**
@@ -233,7 +232,7 @@ public class SampleSingle {
                     log.error("Caught throwable while processing records. Aborting");
                     log.info(t.toString());
                     log.info(t.getStackTrace().toString());
-                    Runtime.getRuntime().halt(1);
+                    Thread.currentThread().interrupt();
                 } finally {
                     MDC.remove(SHARD_ID_MDC_KEY);
                 }
