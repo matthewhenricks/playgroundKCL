@@ -34,15 +34,23 @@ import com.amazonaws.ClientConfiguration;
 import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
 import com.amazonaws.regions.Regions;
+import com.amazonaws.services.cloudwatch.AmazonCloudWatchAsyncClientBuilder;
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDBAsyncClientBuilder;
 import com.amazonaws.services.kinesis.AmazonKinesisAsync;
 import com.amazonaws.services.kinesis.AmazonKinesisAsyncClientBuilder;
 import com.amazonaws.services.kinesis.clientlibrary.exceptions.InvalidStateException;
 import com.amazonaws.services.kinesis.clientlibrary.exceptions.ShutdownException;
+
 import com.amazonaws.services.kinesis.clientlibrary.interfaces.IRecordProcessorCheckpointer;
+import com.amazonaws.services.kinesis.clientlibrary.interfaces.v2.*;
+
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.InitialPositionInStream;
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.KinesisClientLibConfiguration;
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.ShutdownReason;
 import com.amazonaws.services.kinesis.clientlibrary.lib.worker.Worker;
+import com.amazonaws.services.kinesis.clientlibrary.types.InitializationInput;
+import com.amazonaws.services.kinesis.clientlibrary.types.ProcessRecordsInput;
+import com.amazonaws.services.kinesis.clientlibrary.types.ShutdownInput;
 import com.amazonaws.services.kinesis.model.PutRecordRequest;
 import com.amazonaws.services.kinesis.model.PutRecordResult;
 import com.amazonaws.services.kinesis.model.Record;
@@ -50,9 +58,6 @@ import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.amazonaws.services.s3.model.PutObjectResult;
 
-import com.amazonaws.services.kinesis.clientlibrary.interfaces.IRecordProcessor;
-import com.amazonaws.services.kinesis.clientlibrary.interfaces.IRecordProcessorFactory;
-;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -81,14 +86,12 @@ public class SampleSingle {
     }
 
     private final String streamName;
-    private final String applicationName = "reader-java";
-    private final Regions region;
+    private final String applicationName = "reader-java-old";
     private final AmazonKinesisAsync kinesisClient;
 
     private SampleSingle(String streamName, String region) {
         this.streamName = streamName;
-        this.region = Regions.US_WEST_2;
-        this.kinesisClient = AmazonKinesisAsyncClientBuilder.standard().withRegion(this.region).build();
+        this.kinesisClient = AmazonKinesisAsyncClientBuilder.standard().withRegion(Regions.US_WEST_2).build();
     }
 
     private void run() {
@@ -99,7 +102,7 @@ public class SampleSingle {
 
         KinesisClientLibConfiguration kinesisClientLibConfiguration =
             new KinesisClientLibConfiguration(
-                streamName,
+                applicationName,
                 streamName,
                 DefaultAWSCredentialsProviderChain.getInstance(),
                 workerId);
@@ -107,7 +110,14 @@ public class SampleSingle {
         kinesisClientLibConfiguration.withInitialPositionInStream(InitialPositionInStream.TRIM_HORIZON);
 
         IRecordProcessorFactory recordProcessorFactory = new SampleRecordProcessorFactory();
-        Worker worker = new Worker(recordProcessorFactory, kinesisClientLibConfiguration);
+
+        final Worker worker = new Worker.Builder()
+                .recordProcessorFactory(recordProcessorFactory)
+                .config(kinesisClientLibConfiguration)
+                .kinesisClient(kinesisClient)
+                .cloudWatchClient(AmazonCloudWatchAsyncClientBuilder.standard().withRegion(Regions.US_WEST_2).build())
+                .dynamoDBClient(AmazonDynamoDBAsyncClientBuilder.standard().withRegion(Regions.US_WEST_2).build())
+                .build();
 
         Thread schedulerThread = new Thread(worker::run);
         schedulerThread.setDaemon(true);
@@ -157,7 +167,13 @@ public class SampleSingle {
     /**
      * Used to create new record processors.
      */
-    public class SampleRecordProcessorFactory implements IRecordProcessorFactory {
+    public class SampleRecordProcessorFactory  implements IRecordProcessorFactory {
+        /**
+         * Constructor.
+         */
+        public SampleRecordProcessorFactory() {
+            super();
+        }
         /**
          * {@inheritDoc}
          */
@@ -178,7 +194,7 @@ public class SampleSingle {
         private static final long CHECKPOINT_INTERVAL_MILLIS = 5000L;
 
         private final AmazonS3 s3Client = AmazonS3ClientBuilder.standard()
-                .withRegion("us-west-2")
+                .withRegion(Regions.US_WEST_2)
                 .build();
 
         private long nextCheckpointTimeInMillis;
@@ -189,8 +205,8 @@ public class SampleSingle {
          * {@inheritDoc}
          */
         @Override
-        public void initialize(String shardId) {
-            this.shardId = shardId;
+        public void initialize(InitializationInput input) {
+            this.shardId = input.getShardId();
             MDC.put(SHARD_ID_MDC_KEY, shardId);
             nextCheckpointTimeInMillis = System.currentTimeMillis() + CHECKPOINT_INTERVAL_MILLIS;
         }
@@ -199,8 +215,9 @@ public class SampleSingle {
          * {@inheritDoc}
          */
         @Override
-        public void processRecords(List<Record> records, IRecordProcessorCheckpointer checkpointer) {
+        public void processRecords(ProcessRecordsInput processRecordsInput) {
             MDC.put(SHARD_ID_MDC_KEY, shardId);
+            List<Record> records = processRecordsInput.getRecords();
             if (records != null) {
                 try {
                     long millUntilDump = nextCheckpointTimeInMillis - System.currentTimeMillis();
@@ -209,7 +226,7 @@ public class SampleSingle {
                         recordBuffer.add(decoder.decode(records.get(i).getData()).toString());
                     }
                     if (millUntilDump < 0) {
-                        sendToS3AndCheckpoint(checkpointer);
+                        sendToS3AndCheckpoint(processRecordsInput.getCheckpointer());
                         nextCheckpointTimeInMillis = System.currentTimeMillis() + CHECKPOINT_INTERVAL_MILLIS;
                     }
                 } catch (Throwable t) {
@@ -234,13 +251,13 @@ public class SampleSingle {
          * {@inheritDoc}
          */
         @Override
-        public void shutdown(IRecordProcessorCheckpointer checkpointer, ShutdownReason reason) {
+        public void shutdown(ShutdownInput shutdownInput) {
             MDC.put(SHARD_ID_MDC_KEY, shardId);
             log.info("Shutting down record processor for shard");
             try {
                 // Important to checkpoint after reaching end of shard, so we can start processing data from child shards.
-                if (reason == ShutdownReason.TERMINATE) {
-                    sendToS3AndCheckpoint(checkpointer);
+                if (shutdownInput.getShutdownReason() == ShutdownReason.TERMINATE) {
+                    sendToS3AndCheckpoint(shutdownInput.getCheckpointer());
                 }
             } catch (ShutdownException | InvalidStateException e) {
                 log.error("Exception while checkpointing at requested shutdown.  Giving up", e);
